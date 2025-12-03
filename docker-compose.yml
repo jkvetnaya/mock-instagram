@@ -1,0 +1,196 @@
+version: '3.8'
+
+services:
+  # ===================
+  # API Gateway
+  # ===================
+  api-gateway:
+    build: ./api-gateway
+    container_name: instagram-gateway
+    ports:
+      - "8080:80"
+    depends_on:
+      - user-service
+      - post-service
+      - media-service
+      - feed-service
+    networks:
+      - instagram-network
+    restart: unless-stopped
+
+  # ===================
+  # Microservices
+  # ===================
+  user-service:
+    build: ./user-service
+    container_name: instagram-user-service
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - DATABASE_URL=postgresql://instagram:instagram123@postgres:5432/instagram_users
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://instagram:instagram123@rabbitmq:5672
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - instagram-network
+    restart: unless-stopped
+
+  post-service:
+    build: ./post-service
+    container_name: instagram-post-service
+    environment:
+      - NODE_ENV=development
+      - PORT=3002
+      - DATABASE_URL=postgresql://instagram:instagram123@postgres:5432/instagram_posts
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://instagram:instagram123@rabbitmq:5672
+      - MEDIA_SERVICE_URL=http://media-service:3003
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - instagram-network
+    restart: unless-stopped
+
+  media-service:
+    build: ./media-service
+    container_name: instagram-media-service
+    environment:
+      - NODE_ENV=development
+      - PORT=3003
+      - MINIO_ENDPOINT=minio
+      - MINIO_PORT=9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin123
+      - MINIO_BUCKET=instagram-media
+      - RABBITMQ_URL=amqp://instagram:instagram123@rabbitmq:5672
+    depends_on:
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - instagram-network
+    restart: unless-stopped
+
+  feed-service:
+    build: ./feed-service
+    container_name: instagram-feed-service
+    environment:
+      - NODE_ENV=development
+      - PORT=3004
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://instagram:instagram123@rabbitmq:5672
+      - POST_SERVICE_URL=http://post-service:3002
+      - USER_SERVICE_URL=http://user-service:3001
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - instagram-network
+    restart: unless-stopped
+
+  # ===================
+  # Databases & Storage
+  # ===================
+  postgres:
+    image: postgres:15-alpine
+    container_name: instagram-postgres
+    environment:
+      - POSTGRES_USER=instagram
+      - POSTGRES_PASSWORD=instagram123
+      - POSTGRES_MULTIPLE_DATABASES=instagram_users,instagram_posts
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - instagram-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U instagram"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: instagram-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - instagram-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: instagram-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - instagram-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: instagram-rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=instagram
+      - RABBITMQ_DEFAULT_PASS=instagram123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - instagram-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+networks:
+  instagram-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  rabbitmq_data:
