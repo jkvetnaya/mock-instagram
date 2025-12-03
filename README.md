@@ -1061,6 +1061,10 @@ Authorization: Bearer {token}
 ### 1. Start All Services
 
 ```bash
+# Using the helper script
+./start.sh
+
+# Or manually
 docker compose up -d --build
 ```
 
@@ -1120,6 +1124,21 @@ curl -X POST http://localhost:8080/api/posts \
 
 ## Development Commands
 
+### Start/Stop Services
+
+```bash
+# Start all services
+./start.sh
+
+# Stop all services (keeps data)
+./stop.sh
+
+# Stop and remove all data (clean reset)
+./stop.sh -v
+```
+
+### Logs & Debugging
+
 ```bash
 # View logs for all services
 docker compose logs -f
@@ -1129,12 +1148,6 @@ docker compose logs -f user-service
 
 # Restart a specific service
 docker compose restart post-service
-
-# Stop all services
-docker compose down
-
-# Stop and remove all data (clean reset)
-docker compose down -v
 
 # Rebuild a specific service
 docker compose build user-service
@@ -1299,9 +1312,10 @@ curl http://localhost:9000/minio/health/live
 
 ```
 mock-instagram/
-├── LICENSE          # Service orchestration
 ├── docker-compose.yml          # Service orchestration
 ├── README.md                   # This file
+├── start.sh                    # Start all services
+├── stop.sh                     # Stop all services
 ├── api-gateway/
 │   ├── Dockerfile              # Nginx container
 │   └── nginx.conf              # Routing configuration
