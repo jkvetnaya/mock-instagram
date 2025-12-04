@@ -131,7 +131,12 @@ test_endpoint "GET" "/api/feed" "" "Get user feed"
 test_endpoint "GET" "/api/feed/stats" "" "Get feed stats"
 
 echo "=== Media Service ==="
-test_endpoint "GET" "/api/media/../health" "" "Media service health (via internal)"
+test_endpoint "GET" "/health/media" "" "Media service health"
+
+echo "=== All Service Health Checks ==="
+test_endpoint "GET" "/health/user" "" "User service health"
+test_endpoint "GET" "/health/post" "" "Post service health"
+test_endpoint "GET" "/health/feed" "" "Feed service health"
 
 echo ""
 echo "================================="

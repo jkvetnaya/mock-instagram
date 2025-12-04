@@ -49,28 +49,28 @@ A complete Instagram clone built with microservices architecture, running in Doc
        │                 │                 │                 │
        └─────────────────┴─────────────────┴─────────────────┘
                                    │
-         ┌─────────────────────────┼─────────────────────────┐
-         │                         │                         │
-         ▼                         ▼                         ▼
-┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│   PostgreSQL    │      │      Redis      │      │    RabbitMQ     │
-│     :5432       │      │     :6379       │      │  :5672/:15672   │
-│                 │      │                 │      │                 │
-│ • Users DB      │      │ • Session cache │      │ • Event bus     │
-│ • Posts DB      │      │ • Feed cache    │      │ • Async tasks   │
-│ • Relational    │      │ • User cache    │      │ • Pub/Sub       │
-└─────────────────┘      └─────────────────┘      └─────────────────┘
-                                                          │
-                              ┌────────────────────────────┘
-                              ▼
-                    ┌─────────────────┐
-                    │      MinIO      │
-                    │  :9000/:9001    │
-                    │                 │
-                    │ • Image storage │
-                    │ • Video storage │
-                    │ • S3-compatible │
-                    └─────────────────┘
+    ┌──────────────────────────────┼──────────────────────────────┐
+    │                    ┌─────────┴─────────┐                    │
+    ▼                    ▼                   ▼                    ▼
+┌─────────────┐  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ PostgreSQL  │  │  ScyllaDB   │    │    Redis    │    │  RabbitMQ   │
+│   :5432     │  │   :9042     │    │   :6379     │    │ :5672/:15672│
+│             │  │             │    │             │    │             │
+│ • Users     │  │ • Feeds     │    │ • Cache     │    │ • Event bus │
+│ • Posts     │  │ • Activity  │    │ • Sessions  │    │ • Pub/Sub   │
+│ • Relations │  │ • Timelines │    │ • Hot data  │    │ • Async     │
+└─────────────┘  └─────────────┘    └─────────────┘    └─────────────┘
+                                           │
+                        ┌──────────────────┘
+                        ▼
+              ┌─────────────────┐
+              │      MinIO      │
+              │  :9000/:9001    │
+              │                 │
+              │ • Image storage │
+              │ • Video storage │
+              │ • S3-compatible │
+              └─────────────────┘
 ```
 
 ### Services Summary
@@ -83,9 +83,33 @@ A complete Instagram clone built with microservices architecture, running in Doc
 | Media Service | 3003 | Node.js + Sharp | File upload, image processing |
 | Feed Service | 3004 | Node.js + Express | Timeline generation, content ranking |
 | PostgreSQL | 5432 | PostgreSQL 15 | Persistent relational data |
-| Redis | 6379 | Redis 7 | Caching, feed storage |
+| ScyllaDB | 9042 | ScyllaDB | Wide-column store for feeds and activity |
+| Redis | 6379 | Redis 7 | Caching, sessions, hot data |
 | RabbitMQ | 5672 | RabbitMQ 3 | Async messaging, event bus |
 | MinIO | 9000 | MinIO | Object storage (S3-compatible) |
+
+### Database Architecture
+
+This project uses a polyglot persistence approach - different databases for different use cases:
+
+| Storage | Type | What It Stores | Why This DB |
+|---------|------|----------------|-------------|
+| **PostgreSQL** | Relational DB | Users, follows, posts metadata, comments, likes | ACID transactions, complex relationships, joins |
+| **ScyllaDB** | Wide-column NoSQL | Feeds, activity logs, timelines | High write throughput, time-series data, horizontal scaling |
+| **Redis** | In-memory cache | Session data, hot cache, rate limits | Sub-millisecond reads, ephemeral data |
+| **MinIO** | Object storage | Images, videos, profile pictures | Large binary files, CDN-friendly |
+
+### Production Alternatives
+
+In a real production environment, you might use:
+
+| This Project | Production Alternative | Notes |
+|--------------|----------------------|-------|
+| PostgreSQL | **Amazon RDS**, **Google Cloud SQL**, **CockroachDB** | Managed services reduce operational burden |
+| ScyllaDB | **Apache Cassandra**, **Amazon DynamoDB**, **ScyllaDB Cloud** | Cassandra is the original, DynamoDB is fully managed |
+| Redis | **Amazon ElastiCache**, **Redis Cloud**, **KeyDB** | Managed Redis with clustering |
+| MinIO | **Amazon S3**, **Google Cloud Storage**, **Cloudflare R2** | True cloud object storage with CDN |
+| RabbitMQ | **Amazon SQS**, **Apache Kafka**, **Google Pub/Sub** | Kafka for higher throughput, SQS for simplicity |
 
 ---
 
@@ -411,7 +435,7 @@ ZADD feed:user123 1699500000000 '{"postId":"abc","userId":"xyz","createdAt":"202
    │                  │                  │                │                 │    to feeds
    │                  │                  │                │                 │────┐
    │                  │                  │                │                 │◀───┘
-   │                  │                  │                │                 │ (Redis)
+   │                  │                  │                │                 │ (ScyllaDB)
    │                  │ 10. Return Post  │                │                 │
    │◀─────────────────│◀─────────────────────────────────│                 │
    │                  │                  │                │                 │
@@ -571,6 +595,65 @@ CREATE INDEX idx_comments_post ON comments(post_id);
 CREATE INDEX idx_likes_post ON likes(post_id);
 CREATE INDEX idx_likes_user ON likes(user_id);
 ```
+
+### Feed Service Database - ScyllaDB (instagram_feeds)
+
+ScyllaDB uses CQL (Cassandra Query Language). Tables are designed around query patterns:
+
+```cql
+-- User feeds: What posts should appear in a user's timeline
+-- Partitioned by user_id for fast lookups
+-- Clustered by created_at DESC for chronological ordering
+CREATE TABLE user_feeds (
+    user_id UUID,
+    created_at TIMESTAMP,
+    post_id UUID,
+    author_id UUID,
+    PRIMARY KEY (user_id, created_at)
+) WITH CLUSTERING ORDER BY (created_at DESC);
+
+-- Query: Get feed for user (fast - single partition scan)
+-- SELECT * FROM user_feeds WHERE user_id = ? LIMIT 20;
+
+-- Activity feed: Notifications for likes, comments, follows
+CREATE TABLE user_activity (
+    user_id UUID,
+    created_at TIMESTAMP,
+    activity_id UUID,
+    activity_type TEXT,      -- 'like', 'comment', 'follow'
+    actor_id UUID,           -- Who performed the action
+    target_id UUID,          -- Post ID or User ID
+    target_type TEXT,        -- 'post', 'comment', 'user'
+    metadata TEXT,           -- JSON for extra data
+    PRIMARY KEY (user_id, created_at)
+) WITH CLUSTERING ORDER BY (created_at DESC);
+
+-- Followers lookup: Who follows a user
+CREATE TABLE user_followers (
+    user_id UUID,
+    follower_id UUID,
+    created_at TIMESTAMP,
+    PRIMARY KEY (user_id, follower_id)
+);
+
+-- Following lookup: Who a user follows
+CREATE TABLE user_following (
+    user_id UUID,
+    following_id UUID,
+    created_at TIMESTAMP,
+    PRIMARY KEY (user_id, following_id)
+);
+```
+
+**Why ScyllaDB for Feeds?**
+
+| Feature | Benefit |
+|---------|---------|
+| Partition by user_id | Each user's feed is stored together |
+| Clustering by timestamp | Natural chronological ordering |
+| Write-optimized | High throughput for fan-out writes |
+| Horizontal scaling | Add nodes as user base grows |
+| Time-series friendly | Feeds are inherently time-ordered |
 
 ---
 
@@ -1120,6 +1203,11 @@ curl -X POST http://localhost:8080/api/posts \
   - Username: `minioadmin`
   - Password: `minioadmin123`
 
+- **ScyllaDB**: Connect via cqlsh
+  ```bash
+  docker compose exec scylladb cqlsh
+  ```
+
 ---
 
 ## Development Commands
@@ -1159,10 +1247,17 @@ docker compose exec postgres psql -U instagram -d instagram_users
 # Check Redis data
 docker compose exec redis redis-cli
 > KEYS *
-> ZRANGE feed:user123 0 -1 REV
+> GET feed_cache:user123:0:20
 
 # Check RabbitMQ queues
 docker compose exec rabbitmq rabbitmqctl list_queues
+
+# Check ScyllaDB data
+docker compose exec scylladb cqlsh
+> USE instagram_feeds;
+> SELECT * FROM user_feeds WHERE user_id = <uuid> LIMIT 10;
+> SELECT * FROM user_followers WHERE user_id = <uuid>;
+> DESCRIBE TABLES;
 ```
 
 ---
@@ -1282,9 +1377,31 @@ INFO memory
 # List all keys
 KEYS *
 
-# Check feed for a user
-ZRANGE feed:user-id-here 0 -1 REV WITHSCORES
+# Check cache for a user's feed
+GET feed_cache:user-id-here:0:20
 ```
+
+### ScyllaDB Issues
+
+```bash
+# Connect to ScyllaDB
+docker compose exec scylladb cqlsh
+
+# Check cluster status
+docker compose exec scylladb nodetool status
+
+# Check if keyspace exists
+USE instagram_feeds;
+DESCRIBE KEYSPACE instagram_feeds;
+
+# Check table data
+SELECT * FROM user_feeds LIMIT 5;
+
+# Check ScyllaDB logs
+docker compose logs scylladb
+```
+
+**Note:** ScyllaDB takes ~60 seconds to start up. The healthcheck has a `start_period: 60s` to account for this.
 
 ### MinIO Issues
 

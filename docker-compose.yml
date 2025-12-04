@@ -94,10 +94,15 @@ services:
       - RABBITMQ_URL=amqp://instagram:instagram123@rabbitmq:5672
       - POST_SERVICE_URL=http://post-service:3002
       - USER_SERVICE_URL=http://user-service:3001
+      - SCYLLA_HOSTS=scylladb
+      - SCYLLA_DATACENTER=datacenter1
+      - SCYLLA_KEYSPACE=instagram_feeds
     depends_on:
       redis:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      scylladb:
         condition: service_healthy
     networks:
       - instagram-network
@@ -142,6 +147,26 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  scylladb:
+    image: scylladb/scylla:5.4
+    container_name: instagram-scylladb
+    command: --seeds=scylladb --smp 2 --memory 750M --overprovisioned 1 --api-address 0.0.0.0
+    volumes:
+      - scylla_data:/var/lib/scylla
+    ports:
+      - "9042:9042"   # CQL native transport
+      - "9160:9160"   # Thrift client API
+      - "10000:10000" # REST API
+    networks:
+      - instagram-network
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
     restart: unless-stopped
 
   minio:
@@ -192,5 +217,6 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+  scylla_data:
   minio_data:
   rabbitmq_data:

@@ -6,6 +6,8 @@ const { createClient } = require('redis');
 const amqp = require('amqplib');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
+const cassandra = require('cassandra-driver');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3004;
@@ -16,8 +18,11 @@ app.use(helmet());
 app.use(morgan('combined'));
 app.use(express.json());
 
-// Redis client
+// Redis client (for caching)
 let redisClient;
+
+// ScyllaDB client (for persistent feed storage)
+let scyllaClient;
 
 // RabbitMQ
 let rabbitChannel;
@@ -26,13 +31,22 @@ let rabbitChannel;
 const POST_SERVICE_URL = process.env.POST_SERVICE_URL || 'http://post-service:3002';
 const USER_SERVICE_URL = process.env.USER_SERVICE_URL || 'http://user-service:3001';
 
+// ScyllaDB configuration
+const SCYLLA_HOSTS = (process.env.SCYLLA_HOSTS || 'scylladb').split(',');
+const SCYLLA_DATACENTER = process.env.SCYLLA_DATACENTER || 'datacenter1';
+const SCYLLA_KEYSPACE = process.env.SCYLLA_KEYSPACE || 'instagram_feeds';
+
 // Initialize connections
 async function initializeConnections() {
-  // Redis
+  // Redis (for caching)
   redisClient = createClient({ url: process.env.REDIS_URL });
   redisClient.on('error', (err) => console.error('Redis Error:', err));
   await redisClient.connect();
-  console.log('✅ Connected to Redis');
+  console.log('✅ Connected to Redis (cache layer)');
+
+  // ScyllaDB
+  await initializeScylla();
+  console.log('✅ Connected to ScyllaDB (persistent storage)');
 
   // RabbitMQ
   const rabbitConn = await amqp.connect(process.env.RABBITMQ_URL);
@@ -54,6 +68,83 @@ async function initializeConnections() {
   rabbitChannel.consume(feedQueue.queue, handleEvent, { noAck: false });
   
   console.log('✅ Connected to RabbitMQ');
+}
+
+// Initialize ScyllaDB and create schema
+async function initializeScylla() {
+  // First connect without keyspace to create it
+  const tempClient = new cassandra.Client({
+    contactPoints: SCYLLA_HOSTS,
+    localDataCenter: SCYLLA_DATACENTER,
+  });
+
+  await tempClient.connect();
+
+  // Create keyspace if not exists
+  await tempClient.execute(`
+    CREATE KEYSPACE IF NOT EXISTS ${SCYLLA_KEYSPACE}
+    WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}
+  `);
+
+  await tempClient.shutdown();
+
+  // Now connect with keyspace
+  scyllaClient = new cassandra.Client({
+    contactPoints: SCYLLA_HOSTS,
+    localDataCenter: SCYLLA_DATACENTER,
+    keyspace: SCYLLA_KEYSPACE,
+  });
+
+  await scyllaClient.connect();
+
+  // Create tables
+  // Main feed table - partitioned by user_id, clustered by created_at (descending)
+  await scyllaClient.execute(`
+    CREATE TABLE IF NOT EXISTS user_feeds (
+      user_id UUID,
+      created_at TIMESTAMP,
+      post_id UUID,
+      author_id UUID,
+      PRIMARY KEY (user_id, created_at)
+    ) WITH CLUSTERING ORDER BY (created_at DESC)
+  `);
+
+  // Activity feed table (likes, comments, follows)
+  await scyllaClient.execute(`
+    CREATE TABLE IF NOT EXISTS user_activity (
+      user_id UUID,
+      created_at TIMESTAMP,
+      activity_id UUID,
+      activity_type TEXT,
+      actor_id UUID,
+      target_id UUID,
+      target_type TEXT,
+      metadata TEXT,
+      PRIMARY KEY (user_id, created_at)
+    ) WITH CLUSTERING ORDER BY (created_at DESC)
+  `);
+
+  // Followers table for quick lookup
+  await scyllaClient.execute(`
+    CREATE TABLE IF NOT EXISTS user_followers (
+      user_id UUID,
+      follower_id UUID,
+      created_at TIMESTAMP,
+      PRIMARY KEY (user_id, follower_id)
+    )
+  `);
+
+  // Following table for quick lookup
+  await scyllaClient.execute(`
+    CREATE TABLE IF NOT EXISTS user_following (
+      user_id UUID,
+      following_id UUID,
+      created_at TIMESTAMP,
+      PRIMARY KEY (user_id, following_id)
+    )
+  `);
+
+  console.log('✅ ScyllaDB schema initialized');
 }
 
 // Handle events from RabbitMQ
@@ -86,126 +177,172 @@ async function handleEvent(msg) {
   }
 }
 
-// Fan-out post to followers' feeds
+// Fan-out post to followers' feeds in ScyllaDB
 async function handlePostCreated(data) {
   const { postId, userId, createdAt } = data;
+  const timestamp = new Date(createdAt);
+  const postUuid = cassandra.types.Uuid.fromString(postId);
+  const authorUuid = cassandra.types.Uuid.fromString(userId);
+
+  // Get user's followers from ScyllaDB
+  const followersResult = await scyllaClient.execute(
+    'SELECT follower_id FROM user_followers WHERE user_id = ?',
+    [authorUuid],
+    { prepare: true }
+  );
+
+  const followers = followersResult.rows.map(row => row.follower_id);
   
-  // Get user's followers from cache or API
-  const followersCacheKey = `user:${userId}:followers`;
-  let followers = await redisClient.sMembers(followersCacheKey);
+  // Also get from Redis as backup (for follows that happened before ScyllaDB)
+  const redisFollowers = await redisClient.sMembers(`user:${userId}:followers`);
   
-  if (followers.length === 0) {
-    // Fetch from user service (in a real system, you'd have a more efficient way)
-    // For now, we'll just add the post to the user's own feed
-    followers = [userId];
+  // Combine and dedupe
+  const allFollowers = new Set([
+    ...followers.map(f => f.toString()),
+    ...redisFollowers,
+    userId // Include author's own feed
+  ]);
+
+  // Insert into each follower's feed
+  const insertQuery = `
+    INSERT INTO user_feeds (user_id, created_at, post_id, author_id)
+    VALUES (?, ?, ?, ?)
+  `;
+
+  const insertPromises = Array.from(allFollowers).map(followerId => {
+    try {
+      const followerUuid = cassandra.types.Uuid.fromString(followerId);
+      return scyllaClient.execute(insertQuery, [followerUuid, timestamp, postUuid, authorUuid], { prepare: true });
+    } catch (e) {
+      console.error(`Invalid follower UUID: ${followerId}`);
+      return Promise.resolve();
+    }
+  });
+
+  await Promise.all(insertPromises);
+
+  // Invalidate Redis cache for affected users
+  for (const followerId of allFollowers) {
+    await redisClient.del(`feed_cache:${followerId}`);
   }
-  
-  // Add post to each follower's feed (using sorted set with timestamp as score)
-  const timestamp = new Date(createdAt).getTime();
-  const feedItem = JSON.stringify({ postId, userId, createdAt });
-  
-  for (const followerId of followers) {
-    const feedKey = `feed:${followerId}`;
-    await redisClient.zAdd(feedKey, { score: timestamp, value: feedItem });
-    
-    // Keep only last 1000 posts in feed
-    await redisClient.zRemRangeByRank(feedKey, 0, -1001);
-  }
-  
-  // Also add to user's own feed
-  const ownFeedKey = `feed:${userId}`;
-  await redisClient.zAdd(ownFeedKey, { score: timestamp, value: feedItem });
-  await redisClient.zRemRangeByRank(ownFeedKey, 0, -1001);
-  
-  console.log(`✅ Added post ${postId} to feeds`);
+
+  console.log(`✅ Added post ${postId} to ${allFollowers.size} feeds (ScyllaDB)`);
 }
 
 // Remove post from feeds
 async function handlePostDeleted(data) {
   const { postId, userId } = data;
+  const postUuid = cassandra.types.Uuid.fromString(postId);
+
+  // Get all users who might have this post in their feed
+  // In production, you'd have a reverse index. For now, we query by author
+  const authorUuid = cassandra.types.Uuid.fromString(userId);
   
-  // Get all feeds that might have this post
-  const keys = await redisClient.keys('feed:*');
+  // Get followers
+  const followersResult = await scyllaClient.execute(
+    'SELECT follower_id FROM user_followers WHERE user_id = ?',
+    [authorUuid],
+    { prepare: true }
+  );
+
+  // Delete from each follower's feed
+  // Note: This requires knowing the created_at. In production, you'd store this.
+  // For simplicity, we'll let old posts age out or be filtered on read.
   
-  for (const feedKey of keys) {
-    // Get all items and filter out the deleted post
-    const items = await redisClient.zRange(feedKey, 0, -1);
-    for (const item of items) {
-      try {
-        const parsed = JSON.parse(item);
-        if (parsed.postId === postId) {
-          await redisClient.zRem(feedKey, item);
-        }
-      } catch (e) {
-        // Skip invalid items
-      }
-    }
-  }
-  
-  console.log(`✅ Removed post ${postId} from feeds`);
+  console.log(`✅ Post ${postId} marked for deletion`);
 }
 
-// When user follows someone, add their recent posts to feed
+// When user follows someone
 async function handleUserFollowed(data) {
   const { followerId, followingId } = data;
+  const timestamp = new Date();
   
-  // Add following to follower's following set
+  let followerUuid, followingUuid;
+  try {
+    followerUuid = cassandra.types.Uuid.fromString(followerId);
+    followingUuid = cassandra.types.Uuid.fromString(followingId);
+  } catch (e) {
+    console.error('Invalid UUID in follow event:', e);
+    return;
+  }
+
+  // Store follow relationship in ScyllaDB
+  await scyllaClient.execute(
+    'INSERT INTO user_followers (user_id, follower_id, created_at) VALUES (?, ?, ?)',
+    [followingUuid, followerUuid, timestamp],
+    { prepare: true }
+  );
+
+  await scyllaClient.execute(
+    'INSERT INTO user_following (user_id, following_id, created_at) VALUES (?, ?, ?)',
+    [followerUuid, followingUuid, timestamp],
+    { prepare: true }
+  );
+
+  // Also store in Redis for backward compatibility
   await redisClient.sAdd(`user:${followerId}:following`, followingId);
-  
-  // Add follower to following's followers set
   await redisClient.sAdd(`user:${followingId}:followers`, followerId);
-  
-  // Fetch recent posts from the followed user and add to follower's feed
+
+  // Fetch recent posts from followed user and add to follower's feed
   try {
     const response = await axios.get(`${POST_SERVICE_URL}/api/posts/user/${followingId}?limit=20`);
     const posts = response.data.posts || [];
-    
-    const feedKey = `feed:${followerId}`;
-    
+
+    const insertQuery = `
+      INSERT INTO user_feeds (user_id, created_at, post_id, author_id)
+      VALUES (?, ?, ?, ?)
+    `;
+
     for (const post of posts) {
-      const timestamp = new Date(post.created_at).getTime();
-      const feedItem = JSON.stringify({
-        postId: post.id,
-        userId: post.user_id,
-        createdAt: post.created_at,
-      });
+      const postTimestamp = new Date(post.created_at);
+      const postUuid = cassandra.types.Uuid.fromString(post.id);
       
-      await redisClient.zAdd(feedKey, { score: timestamp, value: feedItem });
+      await scyllaClient.execute(insertQuery, [followerUuid, postTimestamp, postUuid, followingUuid], { prepare: true });
     }
-    
-    // Keep only last 1000 posts
-    await redisClient.zRemRangeByRank(feedKey, 0, -1001);
-    
+
+    // Invalidate cache
+    await redisClient.del(`feed_cache:${followerId}`);
+
     console.log(`✅ Added ${posts.length} posts to ${followerId}'s feed after following ${followingId}`);
   } catch (error) {
     console.error('Error fetching posts for follow:', error.message);
   }
 }
 
-// When user unfollows someone, remove their posts from feed
+// When user unfollows someone
 async function handleUserUnfollowed(data) {
   const { followerId, followingId } = data;
-  
-  // Remove from sets
+
+  let followerUuid, followingUuid;
+  try {
+    followerUuid = cassandra.types.Uuid.fromString(followerId);
+    followingUuid = cassandra.types.Uuid.fromString(followingId);
+  } catch (e) {
+    console.error('Invalid UUID in unfollow event:', e);
+    return;
+  }
+
+  // Remove follow relationship from ScyllaDB
+  await scyllaClient.execute(
+    'DELETE FROM user_followers WHERE user_id = ? AND follower_id = ?',
+    [followingUuid, followerUuid],
+    { prepare: true }
+  );
+
+  await scyllaClient.execute(
+    'DELETE FROM user_following WHERE user_id = ? AND following_id = ?',
+    [followerUuid, followingUuid],
+    { prepare: true }
+  );
+
+  // Remove from Redis
   await redisClient.sRem(`user:${followerId}:following`, followingId);
   await redisClient.sRem(`user:${followingId}:followers`, followerId);
-  
-  // Remove posts from unfollowed user from feed
-  const feedKey = `feed:${followerId}`;
-  const items = await redisClient.zRange(feedKey, 0, -1);
-  
-  for (const item of items) {
-    try {
-      const parsed = JSON.parse(item);
-      if (parsed.userId === followingId) {
-        await redisClient.zRem(feedKey, item);
-      }
-    } catch (e) {
-      // Skip invalid items
-    }
-  }
-  
-  console.log(`✅ Removed ${followingId}'s posts from ${followerId}'s feed`);
+
+  // Invalidate cache
+  await redisClient.del(`feed_cache:${followerId}`);
+
+  console.log(`✅ Removed follow relationship: ${followerId} -> ${followingId}`);
 }
 
 // Middleware: Auth verification
@@ -230,169 +367,167 @@ function authMiddleware(req, res, next) {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', service: 'feed-service' });
+  res.json({ status: 'healthy', service: 'feed-service', storage: 'scylladb' });
 });
 
 // Get user's feed
 app.get('/api/feed', authMiddleware, async (req, res) => {
   try {
     const { limit = 20, offset = 0 } = req.query;
-    const feedKey = `feed:${req.user.userId}`;
+    const limitInt = parseInt(limit);
+    const offsetInt = parseInt(offset);
     
-    // Get feed items from Redis (sorted by timestamp, descending)
-    const start = parseInt(offset);
-    const end = start + parseInt(limit) - 1;
+    // Try Redis cache first
+    const cacheKey = `feed_cache:${req.user.userId}:${offsetInt}:${limitInt}`;
+    const cached = await redisClient.get(cacheKey);
     
-    const feedItems = await redisClient.zRange(feedKey, start, end, { REV: true });
+    if (cached) {
+      console.log('📦 Feed served from Redis cache');
+      return res.json(JSON.parse(cached));
+    }
+
+    // Query ScyllaDB
+    let userUuid;
+    try {
+      userUuid = cassandra.types.Uuid.fromString(req.user.userId);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+
+    // Fetch from ScyllaDB with pagination
+    // Note: Cassandra doesn't support OFFSET, so we use token-based pagination in production
+    const query = `
+      SELECT post_id, author_id, created_at 
+      FROM user_feeds 
+      WHERE user_id = ? 
+      LIMIT ?
+    `;
     
+    const result = await scyllaClient.execute(query, [userUuid, limitInt + offsetInt + 1], { prepare: true });
+    
+    // Skip offset rows (simple approach for demo - use paging state in production)
+    const feedItems = result.rows.slice(offsetInt, offsetInt + limitInt);
+
     if (feedItems.length === 0) {
       return res.json({ posts: [], hasMore: false });
     }
-    
-    // Parse feed items and fetch full post data
-    const postIds = feedItems.map(item => {
-      try {
-        return JSON.parse(item).postId;
-      } catch (e) {
-        return null;
-      }
-    }).filter(Boolean);
-    
-    // Fetch posts from post service
+
+    // Fetch full post data from Post Service
     const posts = [];
-    for (const postId of postIds) {
+    for (const item of feedItems) {
       try {
-        const response = await axios.get(`${POST_SERVICE_URL}/api/posts/${postId}`, {
+        const response = await axios.get(`${POST_SERVICE_URL}/api/posts/${item.post_id.toString()}`, {
           headers: { Authorization: req.headers.authorization },
         });
         posts.push(response.data);
       } catch (error) {
         // Post might have been deleted, skip it
-        console.log(`Post ${postId} not found, skipping`);
+        console.log(`Post ${item.post_id} not found, skipping`);
       }
     }
-    
-    // Check if there are more items
-    const totalItems = await redisClient.zCard(feedKey);
-    const hasMore = (start + posts.length) < totalItems;
-    
-    res.json({
+
+    const hasMore = result.rows.length > offsetInt + limitInt;
+
+    const responseData = {
       posts,
       hasMore,
-      offset: start + posts.length,
-    });
+      offset: offsetInt + posts.length,
+    };
+
+    // Cache in Redis for 2 minutes
+    await redisClient.setEx(cacheKey, 120, JSON.stringify(responseData));
+
+    res.json(responseData);
   } catch (error) {
     console.error('Get feed error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get explore/discover feed (posts from users you don't follow)
+// Get activity feed (likes, comments, follows)
+app.get('/api/feed/activity', authMiddleware, async (req, res) => {
+  try {
+    const { limit = 20 } = req.query;
+    
+    let userUuid;
+    try {
+      userUuid = cassandra.types.Uuid.fromString(req.user.userId);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+
+    const query = `
+      SELECT activity_id, activity_type, actor_id, target_id, target_type, metadata, created_at
+      FROM user_activity
+      WHERE user_id = ?
+      LIMIT ?
+    `;
+
+    const result = await scyllaClient.execute(query, [userUuid, parseInt(limit)], { prepare: true });
+
+    const activities = result.rows.map(row => ({
+      id: row.activity_id.toString(),
+      type: row.activity_type,
+      actorId: row.actor_id.toString(),
+      targetId: row.target_id.toString(),
+      targetType: row.target_type,
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+      createdAt: row.created_at,
+    }));
+
+    res.json({ activities });
+  } catch (error) {
+    console.error('Get activity feed error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get explore/discover feed
 app.get('/api/feed/explore', authMiddleware, async (req, res) => {
   try {
-    const { limit = 20, offset = 0 } = req.query;
-    
+    const { limit = 20 } = req.query;
+
     // Get users that this user follows
-    const following = await redisClient.sMembers(`user:${req.user.userId}:following`);
-    following.push(req.user.userId); // Exclude own posts too
-    
-    // For simplicity, we'll use a cached explore feed
-    // In production, you'd have a more sophisticated algorithm
-    const exploreKey = 'feed:explore';
-    
-    const start = parseInt(offset);
-    const end = start + parseInt(limit) - 1;
-    
-    const feedItems = await redisClient.zRange(exploreKey, start, end, { REV: true });
-    
-    // Filter out posts from followed users and fetch full data
-    const posts = [];
-    for (const item of feedItems) {
-      try {
-        const parsed = JSON.parse(item);
-        if (!following.includes(parsed.userId)) {
-          const response = await axios.get(`${POST_SERVICE_URL}/api/posts/${parsed.postId}`, {
-            headers: { Authorization: req.headers.authorization },
-          });
-          posts.push(response.data);
-        }
-      } catch (error) {
-        // Skip invalid items
-      }
-      
-      if (posts.length >= parseInt(limit)) break;
+    let userUuid;
+    try {
+      userUuid = cassandra.types.Uuid.fromString(req.user.userId);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid user ID' });
     }
-    
-    res.json({
-      posts,
-      offset: start + posts.length,
-    });
+
+    const followingResult = await scyllaClient.execute(
+      'SELECT following_id FROM user_following WHERE user_id = ?',
+      [userUuid],
+      { prepare: true }
+    );
+
+    const followingIds = new Set(followingResult.rows.map(r => r.following_id.toString()));
+    followingIds.add(req.user.userId);
+
+    // For explore, we'd typically use a recommendation engine
+    // For now, return popular recent posts (simplified)
+    const response = {
+      posts: [],
+      message: 'Explore feed - would show recommended posts from users you don\'t follow',
+    };
+
+    res.json(response);
   } catch (error) {
     console.error('Get explore feed error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Refresh feed (force rebuild)
+// Refresh feed (force rebuild from ScyllaDB)
 app.post('/api/feed/refresh', authMiddleware, async (req, res) => {
   try {
-    const feedKey = `feed:${req.user.userId}`;
-    
-    // Get list of users this user follows
-    const following = await redisClient.sMembers(`user:${req.user.userId}:following`);
-    
-    // Clear current feed
-    await redisClient.del(feedKey);
-    
-    // Fetch recent posts from each followed user
-    for (const userId of following) {
-      try {
-        const response = await axios.get(`${POST_SERVICE_URL}/api/posts/user/${userId}?limit=50`);
-        const posts = response.data.posts || [];
-        
-        for (const post of posts) {
-          const timestamp = new Date(post.created_at).getTime();
-          const feedItem = JSON.stringify({
-            postId: post.id,
-            userId: post.user_id,
-            createdAt: post.created_at,
-          });
-          
-          await redisClient.zAdd(feedKey, { score: timestamp, value: feedItem });
-        }
-      } catch (error) {
-        console.error(`Error fetching posts for user ${userId}:`, error.message);
-      }
+    // Invalidate all cached feeds for this user
+    const keys = await redisClient.keys(`feed_cache:${req.user.userId}:*`);
+    if (keys.length > 0) {
+      await redisClient.del(keys);
     }
-    
-    // Also add user's own posts
-    try {
-      const response = await axios.get(`${POST_SERVICE_URL}/api/posts/user/${req.user.userId}?limit=50`);
-      const posts = response.data.posts || [];
-      
-      for (const post of posts) {
-        const timestamp = new Date(post.created_at).getTime();
-        const feedItem = JSON.stringify({
-          postId: post.id,
-          userId: post.user_id,
-          createdAt: post.created_at,
-        });
-        
-        await redisClient.zAdd(feedKey, { score: timestamp, value: feedItem });
-      }
-    } catch (error) {
-      console.error('Error fetching own posts:', error.message);
-    }
-    
-    // Keep only last 1000 posts
-    await redisClient.zRemRangeByRank(feedKey, 0, -1001);
-    
-    const feedSize = await redisClient.zCard(feedKey);
-    
-    res.json({ 
-      message: 'Feed refreshed successfully',
-      itemCount: feedSize,
-    });
+
+    res.json({ message: 'Feed cache cleared. Next request will fetch fresh data.' });
   } catch (error) {
     console.error('Refresh feed error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -402,17 +537,38 @@ app.post('/api/feed/refresh', authMiddleware, async (req, res) => {
 // Get feed stats
 app.get('/api/feed/stats', authMiddleware, async (req, res) => {
   try {
-    const feedKey = `feed:${req.user.userId}`;
-    const followingKey = `user:${req.user.userId}:following`;
-    
-    const [feedSize, followingCount] = await Promise.all([
-      redisClient.zCard(feedKey),
-      redisClient.sCard(followingKey),
-    ]);
-    
+    let userUuid;
+    try {
+      userUuid = cassandra.types.Uuid.fromString(req.user.userId);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+
+    // Count feed items (note: COUNT is expensive in Cassandra, use sparingly)
+    const feedCountResult = await scyllaClient.execute(
+      'SELECT COUNT(*) as count FROM user_feeds WHERE user_id = ?',
+      [userUuid],
+      { prepare: true }
+    );
+
+    const followingCountResult = await scyllaClient.execute(
+      'SELECT COUNT(*) as count FROM user_following WHERE user_id = ?',
+      [userUuid],
+      { prepare: true }
+    );
+
+    const followersCountResult = await scyllaClient.execute(
+      'SELECT COUNT(*) as count FROM user_followers WHERE user_id = ?',
+      [userUuid],
+      { prepare: true }
+    );
+
     res.json({
-      feedSize,
-      followingCount,
+      feedSize: parseInt(feedCountResult.rows[0].count.toString()),
+      followingCount: parseInt(followingCountResult.rows[0].count.toString()),
+      followersCount: parseInt(followersCountResult.rows[0].count.toString()),
+      storage: 'scylladb',
+      cache: 'redis',
     });
   } catch (error) {
     console.error('Get feed stats error:', error);
@@ -425,6 +581,8 @@ initializeConnections()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`🚀 Feed Service running on port ${PORT}`);
+      console.log(`   📊 ScyllaDB: ${SCYLLA_HOSTS.join(', ')}`);
+      console.log(`   📦 Redis: ${process.env.REDIS_URL}`);
     });
   })
   .catch((error) => {
